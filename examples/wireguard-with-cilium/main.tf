@@ -3,42 +3,54 @@ provider "aws" {
 }
 
 provider "kubernetes" {
-  host                   = module.eks_blueprints.eks_cluster_endpoint
-  cluster_ca_certificate = base64decode(module.eks_blueprints.eks_cluster_certificate_authority_data)
-  token                  = data.aws_eks_cluster_auth.this.token
+  host                   = module.eks.cluster_endpoint
+  cluster_ca_certificate = base64decode(module.eks.cluster_certificate_authority_data)
+
+  exec {
+    api_version = "client.authentication.k8s.io/v1beta1"
+    command     = "aws"
+    # This requires the awscli to be installed locally where Terraform is executed
+    args = ["eks", "get-token", "--cluster-name", module.eks.cluster_name]
+  }
 }
 
 provider "helm" {
   kubernetes {
-    host                   = module.eks_blueprints.eks_cluster_endpoint
-    cluster_ca_certificate = base64decode(module.eks_blueprints.eks_cluster_certificate_authority_data)
-    token                  = data.aws_eks_cluster_auth.this.token
+    host                   = module.eks.cluster_endpoint
+    cluster_ca_certificate = base64decode(module.eks.cluster_certificate_authority_data)
+
+    exec {
+      api_version = "client.authentication.k8s.io/v1beta1"
+      command     = "aws"
+      # This requires the awscli to be installed locally where Terraform is executed
+      args = ["eks", "get-token", "--cluster-name", module.eks.cluster_name]
+    }
   }
 }
 
 provider "kubectl" {
-  apply_retry_count      = 10
-  host                   = module.eks_blueprints.eks_cluster_endpoint
-  cluster_ca_certificate = base64decode(module.eks_blueprints.eks_cluster_certificate_authority_data)
+  apply_retry_count      = 5
+  host                   = module.eks.cluster_endpoint
+  cluster_ca_certificate = base64decode(module.eks.cluster_certificate_authority_data)
   load_config_file       = false
-  token                  = data.aws_eks_cluster_auth.this.token
-}
 
-data "aws_eks_cluster_auth" "this" {
-  name = module.eks_blueprints.eks_cluster_id
+  exec {
+    api_version = "client.authentication.k8s.io/v1beta1"
+    command     = "aws"
+    # This requires the awscli to be installed locally where Terraform is executed
+    args = ["eks", "get-token", "--cluster-name", module.eks.cluster_name]
+  }
 }
 
 data "aws_availability_zones" "available" {}
 
 locals {
-  name = basename(path.cwd)
-  # var.cluster_name is for Terratest
-  cluster_name    = local.name
-  cluster_version = "1.24"
-  region          = "us-west-2"
+  name   = basename(path.cwd)
+  region = "us-west-2"
 
   vpc_cidr = "10.0.0.0/16"
   azs      = slice(data.aws_availability_zones.available.names, 0, 3)
+
 
   tags = {
     Blueprint  = local.name
@@ -46,95 +58,101 @@ locals {
   }
 }
 
-#---------------------------------------------------------------
-# EKS Blueprints
-#---------------------------------------------------------------
+################################################################################
+# Cluster
+################################################################################
 
-module "eks_blueprints" {
-  source = "../.."
+module "eks" {
+  source  = "terraform-aws-modules/eks/aws"
+  version = "~> 19.16"
 
-  cluster_name    = local.cluster_name
-  cluster_version = local.cluster_version
+  cluster_name                   = local.name
+  cluster_version                = "1.27"
+  cluster_endpoint_public_access = true
 
-  vpc_id             = module.vpc.vpc_id
-  private_subnet_ids = module.vpc.private_subnets
+  # EKS Addons
+  cluster_addons = {
+    coredns    = {}
+    kube-proxy = {}
+    vpc-cni    = {}
+  }
 
-  managed_node_groups = {
-    # BottleRocket ships with kernel 5.10 so there is no need
-    # to do anything special
-    bottlerocket = {
-      node_group_name = "mg5"
-      instance_types  = ["m5.large"]
-      min_size        = 2
-      desired_size    = 2
-      max_size        = 2
-      ami_type        = "BOTTLEROCKET_x86_64"
-      subnet_ids      = module.vpc.private_subnets
+  vpc_id     = module.vpc.vpc_id
+  subnet_ids = module.vpc.private_subnets
+
+
+  eks_managed_node_groups = {
+    initial = {
+      instance_types = ["m5.large"]
+      # Cilium Wireguard requires Linux Kernel 5.10 or aboved.
+      # For EKS 1.24 and above, the AMI the Kernerl version is 5.10
+      # For EKS 1.23 and below, you need to use Bottlerocket OS. For example:
+      #    ami_type = "BOTTLEROCKET_x86_64"
+      #    platform = "bottlerocket"
+      min_size     = 1
+      max_size     = 3
+      desired_size = 2
+    }
+  }
+  # Extend node-to-node security group rules
+  node_security_group_additional_rules = {
+    ingress_cilium_wireguard = {
+      description = "Allow Cilium Wireguard node to node"
+      protocol    = "udp"
+      from_port   = 51871
+      to_port     = 51871 # Cilium Wireguard Port https://github.com/cilium/cilium/blob/main/Documentation/security/network/encryption-wireguard.rst
+      type        = "ingress"
+      self        = true
     }
   }
 
   tags = local.tags
 }
 
-module "eks_blueprints_kubernetes_addons" {
-  source = "../../modules/kubernetes-addons"
+################################################################################
+# Cilium Helm Chart for e2e encryption with Wireguard
+################################################################################
 
-  eks_cluster_id       = module.eks_blueprints.eks_cluster_id
-  eks_cluster_endpoint = module.eks_blueprints.eks_cluster_endpoint
-  eks_oidc_provider    = module.eks_blueprints.oidc_provider
-  eks_cluster_version  = module.eks_blueprints.eks_cluster_version
+resource "helm_release" "cilium" {
+  name             = "cilium"
+  chart            = "cilium"
+  version          = "1.13.2"
+  repository       = "https://helm.cilium.io/"
+  description      = "Cilium Add-on"
+  namespace        = "kube-system"
+  create_namespace = false
 
-  # Wait on the `kube-system` profile before provisioning addons
-  data_plane_wait_arn = module.eks_blueprints.managed_node_group_arn[0]
+  values = [
+    <<-EOT
+      cni:
+        chainingMode: aws-cni
+      enableIPv4Masquerade: false
+      tunnel: disabled
+      endpointRoutes:
+        enabled: true
+      l7Proxy: false
+      encryption:
+        enabled: true
+        type: wireguard
+    EOT
+  ]
 
-  # Add-ons
-  enable_cilium           = true
-  cilium_enable_wireguard = true
-
-  tags = local.tags
-}
-
-#---------------------------------------------------------------
-# Supporting Resources
-#---------------------------------------------------------------
-
-module "vpc" {
-  source  = "terraform-aws-modules/vpc/aws"
-  version = "~> 3.0"
-
-  name = local.name
-  cidr = local.vpc_cidr
-
-  azs             = local.azs
-  public_subnets  = [for k, v in local.azs : cidrsubnet(local.vpc_cidr, 8, k)]
-  private_subnets = [for k, v in local.azs : cidrsubnet(local.vpc_cidr, 8, k + 10)]
-
-  enable_nat_gateway   = true
-  single_nat_gateway   = true
-  enable_dns_hostnames = true
-
-  # Manage so we can name
-  manage_default_network_acl    = true
-  default_network_acl_tags      = { Name = "${local.name}-default" }
-  manage_default_route_table    = true
-  default_route_table_tags      = { Name = "${local.name}-default" }
-  manage_default_security_group = true
-  default_security_group_tags   = { Name = "${local.name}-default" }
-
-  public_subnet_tags = {
-    "kubernetes.io/role/elb" = 1
-  }
-
-  private_subnet_tags = {
-    "kubernetes.io/role/internal-elb" = 1
-  }
-
-  tags = local.tags
+  depends_on = [
+    module.eks
+  ]
 }
 
 #---------------------------------------------------------------
 # Sample App for Testing
 #---------------------------------------------------------------
+
+# For some reason the example pods can't be deployed right after helm install of cilium a delay needs to be introduced. This is being investigated
+resource "time_sleep" "wait_wireguard" {
+  count           = var.enable_example ? 1 : 0
+  create_duration = "15s"
+
+  depends_on = [helm_release.cilium]
+}
 
 resource "kubectl_manifest" "server" {
   count = var.enable_example ? 1 : 0
@@ -171,9 +189,7 @@ resource "kubectl_manifest" "server" {
     }
   })
 
-  depends_on = [
-    module.eks_blueprints_kubernetes_addons
-  ]
+  depends_on = [time_sleep.wait_wireguard]
 }
 
 resource "kubectl_manifest" "service" {
@@ -234,7 +250,34 @@ resource "kubectl_manifest" "client" {
     }
   })
 
-  depends_on = [
-    kubectl_manifest.server[0]
-  ]
+  depends_on = [kubectl_manifest.server]
+}
+
+################################################################################
+# Supporting Resources
+################################################################################
+
+module "vpc" {
+  source  = "terraform-aws-modules/vpc/aws"
+  version = "~> 5.0"
+
+  name = local.name
+  cidr = local.vpc_cidr
+
+  azs             = local.azs
+  private_subnets = [for k, v in local.azs : cidrsubnet(local.vpc_cidr, 4, k)]
+  public_subnets  = [for k, v in local.azs : cidrsubnet(local.vpc_cidr, 8, k + 48)]
+
+  enable_nat_gateway = true
+  single_nat_gateway = true
+
+  public_subnet_tags = {
+    "kubernetes.io/role/elb" = 1
+  }
+
+  private_subnet_tags = {
+    "kubernetes.io/role/internal-elb" = 1
+  }
+
+  tags = local.tags
 }

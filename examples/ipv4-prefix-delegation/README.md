@@ -1,4 +1,4 @@
-# EKS Cluster w/ Prefix Delegation
+# Amazon EKS Cluster w/ Prefix Delegation
 
 This example shows how to provision an EKS cluster with prefix delegation enabled for increasing the number of available IP addresses for the EC2 nodes utilized.
 
@@ -7,9 +7,7 @@ This example shows how to provision an EKS cluster with prefix delegation enable
 
 ## VPC CNI Configuration
 
-In this example, the `vpc-cni` addon is configured outside of the `terraform-aws-eks` module even though the module supports configuring the `vpc-cni` addon. This is done to ensure the `vpc-cni` is updated *before* any EC2 instances are created so that the desired settings have applied before they will be referenced. In the `terraform-aws-eks` module, the addon resource has an explicit `depends_on` set to ensure the EKS managed node group(s), self-managed node group(s), and/or Fargate profile(s) are created *before* the addons. This is because nearly all of the addons require compute in order for them to reach a healthy state, otherwise they will fail and cause the `terraform apply` to fail. However, for the `vpc-cni` which is a daemonset, it does not require compute to exist first, and more importantly, it should be configured *before* compute is created.
-
-With this configuration, you will now see that nodes created will have `--max-pods 110` configured do to the use of prefix delegation being enabled on the `vpc-cni`.
+In this example, the `vpc-cni` addon is configured using `before_compute = true`. This is done to ensure the `vpc-cni` is created and updated *before* any EC2 instances are created so that the desired settings have applied before they will be referenced. With this configuration, you will now see that nodes created will have `--max-pods 110` configured do to the use of prefix delegation being enabled on the `vpc-cni`.
 
 If you find that your nodes are not being created with the correct number of max pods (i.e. - for `m5.large`, if you are seeing a max pods of 29 instead of 110), most likely the `vpc-cni` was not configured *before* the EC2 instances.
 
@@ -56,7 +54,7 @@ ip-10-0-30-125.us-west-2.compute.internal   Ready                         <none>
 3. Inspect the nodes settings and check for the max allocatable pods - should be 110 in this scenario with m5.xlarge:
 
 ```sh
-kubectl describe node ip-10-0-30-125.us-west-2.compute.internal
+kubectl describe node
 
 # Output should look like below (truncated for brevity)
   Capacity:
@@ -93,30 +91,11 @@ kube-system   kube-proxy-plwlc           1/1     Running       0          6m5s
 5. Inspect one of the `aws-node-*` (AWS VPC CNI) pods to ensure prefix delegation is enabled and warm prefix target is 1:
 
 ```sh
-kubectl describe pod aws-node-77rwz -n kube-system
+kubectl describe ds -n kube-system aws-node | grep ENABLE_PREFIX_DELEGATION: -A 3
 
 # Output should look like below (truncated for brevity)
-  Environment:
-    ADDITIONAL_ENI_TAGS:                    {}
-    AWS_VPC_CNI_NODE_PORT_SUPPORT:          true
-    AWS_VPC_ENI_MTU:                        9001
-    AWS_VPC_K8S_CNI_CONFIGURE_RPFILTER:     false
-    AWS_VPC_K8S_CNI_CUSTOM_NETWORK_CFG:     false
-    AWS_VPC_K8S_CNI_EXTERNALSNAT:           false
-    AWS_VPC_K8S_CNI_LOGLEVEL:               DEBUG
-    AWS_VPC_K8S_CNI_LOG_FILE:               /host/var/log/aws-routed-eni/ipamd.log
-    AWS_VPC_K8S_CNI_RANDOMIZESNAT:          prng
-    AWS_VPC_K8S_CNI_VETHPREFIX:             eni
-    AWS_VPC_K8S_PLUGIN_LOG_FILE:            /var/log/aws-routed-eni/plugin.log
-    AWS_VPC_K8S_PLUGIN_LOG_LEVEL:           DEBUG
-    DISABLE_INTROSPECTION:                  false
-    DISABLE_METRICS:                        false
-    DISABLE_NETWORK_RESOURCE_PROVISIONING:  false
-    ENABLE_IPv4:                            true
-    ENABLE_IPv6:                            false
-    ENABLE_POD_ENI:                         false
     ENABLE_PREFIX_DELEGATION:               true # <- this should be set to true
-    MY_NODE_NAME:                            (v1:spec.nodeName)
+    VPC_ID:                                 vpc-0399887df9d0add85
     WARM_ENI_TARGET:                        1 # <- this should be set to 1
     WARM_PREFIX_TARGET:                     1
     ...
